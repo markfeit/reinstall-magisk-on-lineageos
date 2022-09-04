@@ -21,6 +21,38 @@ run_adb() {
 }
 
 
+wait_for() {
+    WHAT=$1
+    shift
+    
+    SECONDS=0
+    PRINTED=false
+    while ! "$@"
+    do
+	if [ "$SECONDS" -eq 0 ]
+	then
+	    printf "Waiting for ${WHAT}."
+	    PRINTED=true
+	fi
+
+        if ((SECONDS > 60)); then
+            echo ' Giving up.' 1>&2
+            exit 2
+        fi
+
+        printf '.'
+        sleep 2
+    done
+
+    if ${PRINTED}
+    then
+	echo
+    fi
+
+}
+
+
+
 # This is invisible inside functions.
 FIRSTARG="$1"
 
@@ -66,25 +98,31 @@ check_phone_is_in_fastboot_mode() {
 }
 
 
-check_phone_is_in_adb_mode() {
-    if run_adb shell true 2>/dev/null
-    then
-	return 0
-    else
-	return 1
-    fi
-}
-
-
 extract_boot_image_on_phone() {
     section Extracting boot image
     enable_adb_root_access
-    # TODO: Need to handle devices with only one slot.
-    BOOT_SUFFIX=$(adb shell 'bootctl get-suffix $(bootctl get-current-slot)')
+
+    # TODO: The nicer way to do this is 'bootctl get-suffix $(bootctl
+    # get-current-slot)', but not all versions of Android have that
+    # yet.  This is more portable.
+    BOOT_SUFFIX=$(run_adb shell getprop ro.boot.slot_suffix )
+
+    if [ -n "${BOOT_SUFFIX}" ]
+    then
+	echo "Multi-slot phone is on slot" \
+	     $(echo "$BOOT_SUFFIX" | sed -e 's/^_//' | tr 'a-z' 'A-Z')
+    fi
+
     PHONE_DOWNLOAD_DIR="/sdcard/Download"
+    if ! run_adb shell test -d "${PHONE_DOWNLOAD_DIR}" -a -w "${PHONE_DOWNLOAD_DIR}"
+    then
+	echo "Unable to find/write to ${PHONE_DOWNLOAD_DIR}"
+	exit 1
+    fi
+    
     UNPATCHED_IMAGE="${PHONE_DOWNLOAD_DIR}/lineage-upgrade-boot.img"
-    adb shell rm -rf "${UNPATCHED_IMAGE}"
-    adb shell dd "if=/dev/block/by-name/boot${BOOT_SUFFIX}" "of=${UNPATCHED_IMAGE}"
+    run_adb shell rm -rf "${UNPATCHED_IMAGE}"
+    run_adb shell dd "if=/dev/block/by-name/boot${BOOT_SUFFIX}" "of=${UNPATCHED_IMAGE}"
 }
 
 
@@ -105,55 +143,16 @@ transfer_patched_boot_image_to_pc() {
 
 
 wait_for_phone_to_be_in_adb() {
-    SECONDS=0
-    until check_phone_is_in_adb_mode; do
-
-	if [ "$SECONDS" -eq 0 ]
-	then
-	    printf 'Waiting for ADB.'
-	fi
-
-        if ((SECONDS > 60)); then
-            echo " Giving up." 1>&2
-            exit 2
-        fi
-
-	printf '.'
-        sleep 2
-    done
-    # TODO: This leaves stray newlines.
-    echo
+    wait_for ADB run_adb shell true 2>/dev/null
 }
 
-
-wait_for_phone_to_be_in_fastboot() {
-    SECONDS=0
-    until check_phone_is_in_fastboot_mode; do
-
-	if [ "$SECONDS" -eq 0 ]
-	then
-	    printf 'Waiting for the boot loader.'
-	fi
-
-
-        if ((SECONDS > 60)); then
-            echo " Giving up" 1>&2
-            exit 2
-        fi
-
-	printf '.'
-        sleep 2
-    done
-    # TODO: This leaves stray newlines.
-    echo
-}
 
 flash_patched_boot_image() {
     section Flashing patched boot image
     run_adb reboot bootloader
-    wait_for_phone_to_be_in_fastboot
+    wait_for "bootloader" check_phone_is_in_fastboot_mode
     # TODO: check if sudo is neded; udev may have been set up.
-    sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot "${PATCHED_IMAGE_LOCAL}"
+    ### sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot "${PATCHED_IMAGE_LOCAL}"
     sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" reboot
 }
 
@@ -191,25 +190,7 @@ enable_adb_root_access() {
 cleanup_leftovers() {
     section Cleaning up  "${PHONE_DOWNLOAD_DIR}" on phone
     enable_adb_root_access
-    SECONDS=0
-    until run_adb shell test -d "${PHONE_DOWNLOAD_DIR}"
-    do
-	if [ "$SECONDS" -eq 0 ]
-	then
-	    printf 'Waiting for the SD card.'
-	fi
-
-        if ((SECONDS > 60)); then
-            echo " Giving up." 1>&2
-            exit 2
-        fi
-
-        printf '.'
-        sleep 2
-    done
-    # TODO: This leaves stray newlines.
-    echo
-
+    wait_for "SD card" run_adb shell test -d "${PHONE_DOWNLOAD_DIR}"
     run_adb shell rm -rf "${UNPATCHED_IMAGE}" "${PATCHED_IMAGE}"
 }
 
@@ -221,6 +202,7 @@ main() {
     transfer_patched_boot_image_to_pc
     flash_patched_boot_image
     cleanup_leftovers
+    section "Magisk is reinstalled."
 }
 
 # Run the main only when this file is executed as script, to help with testing.
