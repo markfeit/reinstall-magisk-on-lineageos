@@ -20,6 +20,12 @@ run_adb() {
     adb -s "$PHONE_ADB_SERIAL_NUMBER" "$@"
 }
 
+run_fastboot() {
+    # TODO: My system requires root because udev isn't set up for the
+    # phone.  Find a way to avoid the sudo automagically.
+    sudo fastboot "$@"
+}
+
 
 wait_for() {
     WHAT=$1
@@ -93,8 +99,7 @@ check_phone_is_connected() {
 }
 
 check_phone_is_in_fastboot_mode() {
-    # TODO: check if sudo is neded; udev may have been set up.
-    sudo fastboot devices | grep --silent "$PHONE_ADB_SERIAL_NUMBER"
+    run_fastboot devices | grep --silent "$PHONE_ADB_SERIAL_NUMBER"
 }
 
 
@@ -152,8 +157,8 @@ flash_patched_boot_image() {
     run_adb reboot bootloader
     wait_for "bootloader" check_phone_is_in_fastboot_mode
     # TODO: check if sudo is neded; udev may have been set up.
-    ### sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot "${PATCHED_IMAGE_LOCAL}"
-    sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" reboot
+    run_fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot "${PATCHED_IMAGE_LOCAL}"
+    run_fastboot -s "$PHONE_ADB_SERIAL_NUMBER" reboot
 }
 
 
