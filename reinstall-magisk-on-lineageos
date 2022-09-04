@@ -2,102 +2,225 @@
 
 set -e
 
-PHONE_ADB_SERIAL_NUMBER=810972cf
+TMPBASE=$(mktemp -d)
+cleanup() {
+    rm -rf "${TEMPBASE}"
+}
+trap cleanup EXIT
+
+
+section() {
+    printf "\n\n"
+    echo "-----" "$@"
+    printf "\n\n"
+}
+
+
+run_adb() {
+    adb -s "$PHONE_ADB_SERIAL_NUMBER" "$@"
+}
+
+
+# This is invisible inside functions.
+FIRSTARG="$1"
+
+determine_device_serial_number() {
+    # If a serial number was specified on the command line, use it.
+    if [ -n "$FIRSTARG" ]
+    then
+	PHONE_ADB_SERIAL_NUMBER="$FIRSTARG"
+	return
+    fi
+    
+    DEVLIST="${TMPBASE}/devlist"
+
+    adb devices | awk '$2 == "device" { print $1 }' > "${DEVLIST}"
+    case $(wc -l "${DEVLIST}" | awk '{ print $1 }') in
+	0)
+	    echo "ERROR: No devices connected." 1>&2
+	    exit 1
+	    ;;
+	1)
+	    PHONE_ADB_SERIAL_NUMBER=$(cat "${DEVLIST}")
+	    ;;
+	*)
+	    echo "ERROR: Multiple devices connected.  Specify one on the command line:" 1>&2
+	    sed -e 's/^/    /' "${DEVLIST}"
+	    exit 1
+	    ;;
+    esac
+}
+
+    
 
 check_phone_is_connected() {
     if ! adb devices | grep --silent "$PHONE_ADB_SERIAL_NUMBER"; then
-        echo "ERROR: phone is not connected"
+        echo "ERROR: device '${PHONE_ADB_SERIAL_NUMBER}' is not connected" 1>&2
         exit 1
     fi
 }
 
 check_phone_is_in_fastboot_mode() {
-    fastboot devices | grep --silent "$PHONE_ADB_SERIAL_NUMBER"
+    # TODO: check if sudo is neded; udev may have been set up.
+    sudo fastboot devices | grep --silent "$PHONE_ADB_SERIAL_NUMBER"
 }
 
-get_lineage_version() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" shell getprop ro.lineage.version | tr -d '\n'
+
+check_phone_is_in_adb_mode() {
+    if run_adb shell true 2>/dev/null
+    then
+	return 0
+    else
+	return 1
+    fi
 }
 
-get_device_name() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" shell getprop ro.lineage.device | tr -d '\n'
+
+extract_boot_image_on_phone() {
+    section Extracting boot image
+    enable_adb_root_access
+    # TODO: Need to handle devices with only one slot.
+    BOOT_SUFFIX=$(adb shell 'bootctl get-suffix $(bootctl get-current-slot)')
+    PHONE_DOWNLOAD_DIR="/sdcard/Download"
+    UNPATCHED_IMAGE="${PHONE_DOWNLOAD_DIR}/lineage-upgrade-boot.img"
+    adb shell rm -rf "${UNPATCHED_IMAGE}"
+    adb shell dd "if=/dev/block/by-name/boot${BOOT_SUFFIX}" "of=${UNPATCHED_IMAGE}"
 }
 
-get_device_downloads_page() {
-    echo "https://download.lineageos.org/$(get_device_name)"
-}
-
-get_build_url() {
-    curl --no-progress-meter "$(get_device_downloads_page)" |
-        grep --perl-regexp --only-matching --ignore-case \
-            "(?<=href=\")https://mirrorbits.lineageos.org/.*?$(get_lineage_version)-signed.zip(?=\")"
-}
-
-download_latest_lineageos_build() {
-    # The --location lets curl follow the redirection.
-    curl --location "$(get_build_url)" --output /tmp/lineageos.zip
-}
-
-extract_boot_image() {
-    unzip -od /tmp /tmp/lineageos.zip boot.img
-}
-
-transfer_unpatched_boot_image_to_phone() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" push /tmp/boot.img /sdcard/Download/boot.img
-}
 
 patch_boot_image_on_phone() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" shell /data/adb/magisk/boot_patch.sh /sdcard/Download/boot.img
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" shell mv /data/adb/magisk/new-boot.img /sdcard/Download/patched-boot.img
+    section Patching boot image
+    ADB_MAGISK="/data/adb/magisk"
+    run_adb shell "${ADB_MAGISK}/boot_patch.sh" "${UNPATCHED_IMAGE}"
+    PATCHED_IMAGE="/sdcard/Download/lineage-upgrade-boot-patched.img"
+    run_adb shell rm -rf "${UNPATCHED_IMAGE}"
+    run_adb shell mv "${ADB_MAGISK}/new-boot.img" "${PATCHED_IMAGE}"
 }
 
 transfer_patched_boot_image_to_pc() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" pull /sdcard/Download/patched-boot.img /tmp
+    section Downloading patched image
+    PATCHED_IMAGE_LOCAL="${TMPBASE}/patched.img"
+    run_adb pull "${PATCHED_IMAGE}" "${PATCHED_IMAGE_LOCAL}"
 }
 
-reboot_to_bootloader() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" reboot bootloader
+
+wait_for_phone_to_be_in_adb() {
+    SECONDS=0
+    until check_phone_is_in_adb_mode; do
+
+	if [ "$SECONDS" -eq 0 ]
+	then
+	    printf 'Waiting for ADB.'
+	fi
+
+        if ((SECONDS > 60)); then
+            echo " Giving up." 1>&2
+            exit 2
+        fi
+
+	printf '.'
+        sleep 2
+    done
+    # TODO: This leaves stray newlines.
+    echo
 }
+
 
 wait_for_phone_to_be_in_fastboot() {
     SECONDS=0
     until check_phone_is_in_fastboot_mode; do
 
+	if [ "$SECONDS" -eq 0 ]
+	then
+	    printf 'Waiting for the boot loader.'
+	fi
+
+
         if ((SECONDS > 60)); then
-            echo "Giving up..."
+            echo " Giving up" 1>&2
             exit 2
         fi
 
-        echo "Phone is not in fastboot mode yet. Waiting..."
-        sleep 5
+	printf '.'
+        sleep 2
     done
+    # TODO: This leaves stray newlines.
+    echo
 }
 
 flash_patched_boot_image() {
-    fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot /tmp/patched-boot.img
+    section Flashing patched boot image
+    run_adb reboot bootloader
+    wait_for_phone_to_be_in_fastboot
+    # TODO: check if sudo is neded; udev may have been set up.
+    sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" flash boot "${PATCHED_IMAGE_LOCAL}"
+    sudo fastboot -s "$PHONE_ADB_SERIAL_NUMBER" reboot
 }
 
-reboot_phone() {
-    fastboot -s "$PHONE_ADB_SERIAL_NUMBER" reboot
+
+test_adb_root_access() {
+    if run_adb shell test -w /proc
+    then
+	return 0
+    else
+	return 1
+    fi
 }
 
 enable_adb_root_access() {
-    adb -s "$PHONE_ADB_SERIAL_NUMBER" root &&
-        adb -s "$PHONE_ADB_SERIAL_NUMBER" shell ls / # Check that the phone allows root debugging.
+
+    wait_for_phone_to_be_in_adb
+    
+    if test_adb_root_access
+    then
+	return 0
+    fi
+
+    run_adb root
+
+     # This doesn't happen instantly after rooting.
+    wait_for_phone_to_be_in_adb
+
+    if ! test_adb_root_access
+    then
+	echo "ADB failed to go into root mode." 1>&2
+	exit 1
+    fi
+}
+
+cleanup_leftovers() {
+    section Cleaning up  "${PHONE_DOWNLOAD_DIR}" on phone
+    enable_adb_root_access
+    SECONDS=0
+    until run_adb shell test -d "${PHONE_DOWNLOAD_DIR}"
+    do
+	if [ "$SECONDS" -eq 0 ]
+	then
+	    printf 'Waiting for the SD card.'
+	fi
+
+        if ((SECONDS > 60)); then
+            echo " Giving up." 1>&2
+            exit 2
+        fi
+
+        printf '.'
+        sleep 2
+    done
+    # TODO: This leaves stray newlines.
+    echo
+
+    run_adb shell rm -rf "${UNPATCHED_IMAGE}" "${PATCHED_IMAGE}"
 }
 
 main() {
+    determine_device_serial_number
     check_phone_is_connected
-    enable_adb_root_access
-    download_latest_lineageos_build
-    extract_boot_image
-    transfer_unpatched_boot_image_to_phone
+    extract_boot_image_on_phone
     patch_boot_image_on_phone
     transfer_patched_boot_image_to_pc
-    reboot_to_bootloader
-    wait_for_phone_to_be_in_fastboot
     flash_patched_boot_image
-    reboot_phone
+    cleanup_leftovers
 }
 
 # Run the main only when this file is executed as script, to help with testing.
